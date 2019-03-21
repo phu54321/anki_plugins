@@ -3,21 +3,22 @@
 # PasteHTML
 #   Let you paste richtext to anki, with formatting preserved.
 #
+# v3. Support for 2.1 added thanks to goerz
+#    https://github.com/goerz/anki_addons21_paste_html
 # v2. bugfix, embedded images are now supported
 # v1. Initial release
 #
 
-from HTMLParser import HTMLParser
 import re
 import cgi
-import urllib2
 import os
+import sys
 
+from anki import version
 from aqt.editor import Editor, EditorWebView
 from aqt.qt import (
     Qt,
     QClipboard,
-    QWebPage,
     QDialog,
     QImage,
     QLabel,
@@ -27,7 +28,32 @@ from aqt.qt import (
 from anki.utils import namedtmp
 from aqt.utils import tooltip
 from anki.lang import _
-from anki.hooks import wrap
+from anki.hooks import wrap, addHook
+
+anki21 = version.startswith("2.1.")
+
+def onAnki21(action_anki21, action_anki20=None):
+    if anki21:
+        if action_anki21:
+            action_anki21()
+    else:
+        if action_anki20:
+            action_anki20()
+
+if anki21:
+    import urllib.request
+    import urllib.error
+    from html.parser import HTMLParser
+    urlopen = urllib.request.urlopen
+    URLError = urllib.error.URLError
+
+else:
+    import urllib2
+    from aqt.qt import QWebPage
+    from HTMLParser import HTMLParser
+    urlopen = urllib2.urlopen
+    URLError = urllib2.URLError
+
 
 # Tags that don't have ending tags.
 _voidElements = {
@@ -237,11 +263,15 @@ def SaveImageToMedia(imageData, editor):
 
 
 def cleanTag(data, editorWebView):
-    parser = NonFormatTagCleaner(editorWebView)
-    parser.feed(data)
-    data = parser.flush()
-    data = re.sub('^\s*\n', '', data, flags=re.M)
-    return data
+    origData = data
+    try:
+        parser = NonFormatTagCleaner(editorWebView)
+        parser.feed(data)
+        data = parser.flush()
+        data = re.sub('^\s*\n', '', data, flags=re.M)
+        return data
+    except:
+        return origData
 
 
 def downloadMedia(url, editor):
@@ -272,7 +302,7 @@ def downloadMedia(url, editor):
 
     # Download chunk by chunk for progress bar
     try:
-        response = urllib2.urlopen(url)
+        response = urlopen(url)
         totSize = int(response.info().getheader('Content-Length').strip())
         currentRead = 0
         chunk_size = 16384
@@ -294,42 +324,13 @@ def downloadMedia(url, editor):
 
         return ''.join(chunks)
 
-    except urllib2.URLError:
+    except URLError:
         return None
 
     finally:
         d.close()
         del d
 
-
-# Hook functions for EditorWebView
-
-
-# Some custom keyboard doesn't support Alt modifier on QShortcut. I don't know
-# why. So here we don't use QShortcut here. Shortcuts will be processed on
-# `newKeyPressEvent`.
-
-def addPasteHtmlShortcut(self):
-    self._addButton(
-        "paste_html",
-        lambda: onHtmlCopy(self.web),
-        _("Shift+Ctrl+Alt+P"),  # Bogus shortcut.
-        _("Paste HTML (Ctrl+Alt+V)"),  # Only this matters
-        check=True,
-        text="PasteHTML"
-    )
-
-
-# Some custom keyboard doesn't support Alt modifier on QShortcut.
-def newKeyPressEvent(self, evt, _old):
-    if (
-        evt.modifiers() == (Qt.AltModifier | Qt.ControlModifier) and
-        evt.key() == Qt.Key_V
-    ):
-        onHtmlCopy(self)
-        return evt.accept()
-    else:
-        return _old(self, evt)
 
 
 def onHtmlCopy(web):
@@ -338,17 +339,77 @@ def onHtmlCopy(web):
     clip = web.editor.mw.app.clipboard()
     mime = clip.mimeData(mode=mode)
 
-    web.saveClip(mode=mode)
+    onAnki21(lambda: web.saveClip(mode=mode))
+
     if mime.hasHtml():
         newMime = QMimeData()
         newHtml = cleanTag(mime.html(), web)
         newMime.setHtml(newHtml)
         clip.setMimeData(newMime, mode=mode)
-    web.triggerPageAction(QWebPage.Paste)
-    web.restoreClip()
+
+        onAnki21(
+            lambda: web.editor.doPaste(newHtml, internal=True),
+            lambda: (
+                web.triggerPageAction(QWebPage.Paste),
+                web.restoreClip()
+            )
+        )
 
 
-Editor.setupButtons = wrap(
-    Editor.setupButtons, addPasteHtmlShortcut, 'after')
-EditorWebView.keyPressEvent = wrap(
-    EditorWebView.keyPressEvent, newKeyPressEvent, 'around')
+# Hook functions for EditorWebView
+
+if anki21:
+    # Hook functions for EditorWebView
+    ADDON_PATH = os.path.dirname(__file__)
+    ICONS_PATH = os.path.join(ADDON_PATH, "icons")
+
+    # anki 2.1 don't expose keyPressEvent function()
+    # Need to use Qt5's own mechanism.
+
+    def buttonSetup(buttons, editor):
+        icon = os.path.join(ICONS_PATH, 'paste.png')
+        if sys.platform == 'darwin':  # macos
+            shortcut = "Cmd+Alt+V"
+        else:
+            shortcut = "Ctrl+Alt+V"
+        b = editor.addButton(
+            icon=icon, cmd='pasteHTML',
+            func=lambda editor: onHtmlCopy(editor.web),
+            tip='Paste formatted HTML (%s)' % shortcut,
+            keys='Ctrl+Alt+V')
+        buttons.append(b)
+        return buttons
+
+    addHook("setupEditorButtons", buttonSetup)
+
+else:
+    # Some custom keyboard doesn't support Alt modifier on QShortcut. I don't know
+    # why. So here we don't use QShortcut here. Shortcuts will be processed on
+    # `newKeyPressEvent`.
+    def addPasteHtmlShortcut(self):
+        self._addButton(
+            "paste_html",
+            lambda: onHtmlCopy(self.web),
+            _("Shift+Ctrl+Alt+P"),  # Bogus shortcut.
+            _("Paste HTML (Ctrl+Alt+V)"),  # Only this matters
+            check=True,
+            text="PasteHTML"
+        )
+
+
+    # Some custom keyboard doesn't support Alt modifier on QShortcut.
+    def newKeyPressEvent(self, evt, _old):
+        if (
+            evt.modifiers() == (Qt.AltModifier | Qt.ControlModifier) and
+            evt.key() == Qt.Key_V
+        ):
+            onHtmlCopy(self)
+            return evt.accept()
+        else:
+            return _old(self, evt)
+
+
+    Editor.setupButtons = wrap(
+        Editor.setupButtons, addPasteHtmlShortcut, 'after')
+    EditorWebView.keyPressEvent = wrap(
+        EditorWebView.keyPressEvent, newKeyPressEvent, 'around')
